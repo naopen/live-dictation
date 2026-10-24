@@ -1,0 +1,762 @@
+import AVFoundation
+import AppKit
+import CoreMedia
+import Foundation
+import Speech
+@preconcurrency import ScreenCaptureKit
+
+/// Captures both sides of a meeting: the selected microphone and audio played by macOS.
+/// ScreenCaptureKit supplies the two sources independently. Japanese mode keeps them apart
+/// all the way to two recognizers so every phrase carries a speaker, while English mode
+/// mixes them into a single signal before recognition.
+/// When the sources stay separate they are also recorded separately, which keeps a session
+/// re-analyzable per speaker afterwards.
+final class MeetingAudioCaptureManager: NSObject, @unchecked Sendable {
+    /// One captured signal: where its audio is recognized, and where it is recorded.
+    struct Destination {
+        let continuation: AsyncStream<AnalyzerInput>.Continuation
+        let audioURL: URL
+    }
+
+    enum Routing {
+        case separated(microphone: Destination, systemAudio: Destination)
+        case mixed(Destination)
+    }
+
+    private static let monoFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 48_000,
+        channels: 1,
+        interleaved: false
+    )!
+
+    private let audioQueue = DispatchQueue(
+        label: "com.minorun365.LiveDictation.meeting-audio",
+        qos: .userInitiated
+    )
+    private let audioEngine = AVAudioEngine()
+    private let microphonePlayer = AVAudioPlayerNode()
+    private let systemAudioPlayer = AVAudioPlayerNode()
+    private let microphoneMixer = AVAudioMixerNode()
+    private let systemAudioMixer = AVAudioMixerNode()
+    private let recordingMixer = AVAudioMixerNode()
+
+    private let microphoneFeed = AnalyzerFeed()
+    private let systemAudioFeed = AnalyzerFeed()
+    private let mixedFeed = AnalyzerFeed()
+    private let microphoneSink = RecordingSink()
+    private let systemAudioSink = RecordingSink()
+    private let mixedSink = RecordingSink()
+
+    private let stateLock = NSLock()
+    private var stream: SCStream?
+    private var microphoneConverter: AVAudioConverter?
+    private var microphoneSourceFormat: AVAudioFormat?
+    private var systemConverter: AVAudioConverter?
+    private var systemSourceFormat: AVAudioFormat?
+    private var runtimeFailureHandler: (@MainActor @Sendable (String) -> Void)?
+    private var sourceReadyHandler: (@MainActor @Sendable (String) -> Void)?
+    private var recoveryHandler: (@MainActor @Sendable (Int) -> Void)?
+    private let displaySleepBlocker = DisplaySleepBlocker()
+    private var recoveryTask: Task<Void, Never>?
+    private var isTearingDown = false
+    private var watchdogTask: Task<Void, Never>?
+    /// Set when the Mac wakes or the screen unlocks, to cut the wait before the next
+    /// reconnection attempt short.
+    private var retryRequested = false
+    private var wakeObservers: [(NotificationCenter, NSObjectProtocol)] = []
+    private var lastSampleAt: Date?
+    private var reportedMicrophoneReady = false
+    private var reportedSystemAudioReady = false
+    private var attachedNodes: [AVAudioNode] = []
+    private var tappedNodes: [AVAudioNode] = []
+
+    var inputFormat: AVAudioFormat { Self.monoFormat }
+
+    func start(
+        analyzerFormat: AVAudioFormat,
+        routing: Routing,
+        onSourceReady: @escaping @MainActor @Sendable (String) -> Void,
+        onRecovered: @escaping @MainActor @Sendable (Int) -> Void,
+        onRuntimeFailure: @escaping @MainActor @Sendable (String) -> Void
+    ) async throws {
+        await stop()
+        stateLock.withLock { isTearingDown = false }
+        sourceReadyHandler = onSourceReady
+        recoveryHandler = onRecovered
+        runtimeFailureHandler = onRuntimeFailure
+
+        do {
+            try buildGraph(analyzerFormat: analyzerFormat, routing: routing)
+            try await startCapture()
+        } catch {
+            await stop()
+            throw error
+        }
+
+        // キャプチャはメインディスプレイに紐づくので、画面が省電力で消えると
+        // マイクごと停止する。録音している間だけ画面を起こしておく。
+        displaySleepBlocker.begin(reason: "LiveDictation is capturing audio")
+        startWatchdog()
+        startWakeObservers()
+    }
+
+    /// Closing the lid cuts the microphone in hardware and takes the display away, so
+    /// capture always breaks while the lid is shut. What matters is how quickly it comes
+    /// back once the lid opens: the capture needs an unlocked screen, and the slow retry
+    /// interval could otherwise leave the first quarter-minute of the meeting unheard.
+    /// Waking and unlocking both ask for an immediate attempt.
+    private func startWakeObservers() {
+        removeWakeObservers()
+        let request: @Sendable (Notification) -> Void = { [weak self] _ in
+            self?.requestImmediateRetry()
+        }
+        let workspace = NSWorkspace.shared.notificationCenter
+        let distributed = DistributedNotificationCenter.default()
+        var observers: [(NotificationCenter, NSObjectProtocol)] = []
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            observers.append((workspace, workspace.addObserver(forName: name, object: nil, queue: nil, using: request)))
+        }
+        observers.append((
+            distributed,
+            distributed.addObserver(
+                forName: Notification.Name("com.apple.screenIsUnlocked"),
+                object: nil,
+                queue: nil,
+                using: request
+            )
+        ))
+        stateLock.withLock { wakeObservers = observers }
+    }
+
+    private func removeWakeObservers() {
+        let observers = stateLock.withLock { () -> [(NotificationCenter, NSObjectProtocol)] in
+            let current = wakeObservers
+            wakeObservers = []
+            return current
+        }
+        for (center, observer) in observers {
+            center.removeObserver(observer)
+        }
+    }
+
+    private func requestImmediateRetry() {
+        stateLock.withLock { retryRequested = true }
+    }
+
+    /// Waits for the retry interval, returning early when a wake or unlock asked for
+    /// an attempt right away.
+    private func waitBeforeRetry(seconds: Int) async {
+        let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        while Date() < deadline {
+            if Task.isCancelled { return }
+            let requested = stateLock.withLock { () -> Bool in
+                let value = retryRequested
+                retryRequested = false
+                return value
+            }
+            if requested { return }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    /// Wires the engine for the requested routing, then starts it.
+    ///
+    /// Each signal is recorded from the same tap that feeds its recognizer, so what is
+    /// written to disk is exactly what was recognized. Writing both sides into one stereo
+    /// file was tried first, but `pan` on an intermediate mixer only takes effect at the
+    /// engine's final mixer, so a tap placed before it still receives the unpanned signal.
+    private func buildGraph(analyzerFormat: AVAudioFormat, routing: Routing) throws {
+        attach(microphonePlayer)
+        attach(systemAudioPlayer)
+        attach(recordingMixer)
+
+        switch routing {
+        case .separated(let microphone, let systemAudio):
+            attach(microphoneMixer)
+            attach(systemAudioMixer)
+
+            audioEngine.connect(microphonePlayer, to: microphoneMixer, format: Self.monoFormat)
+            audioEngine.connect(systemAudioPlayer, to: systemAudioMixer, format: Self.monoFormat)
+            audioEngine.connect(microphoneMixer, to: recordingMixer, format: Self.monoFormat)
+            audioEngine.connect(systemAudioMixer, to: recordingMixer, format: Self.monoFormat)
+            audioEngine.connect(
+                recordingMixer,
+                to: audioEngine.mainMixerNode,
+                format: Self.monoFormat
+            )
+
+            configure(
+                feed: microphoneFeed,
+                node: microphoneMixer,
+                continuation: microphone.continuation,
+                analyzerFormat: analyzerFormat
+            )
+            configure(
+                feed: systemAudioFeed,
+                node: systemAudioMixer,
+                continuation: systemAudio.continuation,
+                analyzerFormat: analyzerFormat
+            )
+            try configure(
+                sink: microphoneSink,
+                node: microphoneMixer,
+                audioURL: microphone.audioURL
+            )
+            try configure(
+                sink: systemAudioSink,
+                node: systemAudioMixer,
+                audioURL: systemAudio.audioURL
+            )
+
+            installTap(on: microphoneMixer, feed: microphoneFeed, sink: microphoneSink)
+            installTap(on: systemAudioMixer, feed: systemAudioFeed, sink: systemAudioSink)
+
+        case .mixed(let destination):
+            audioEngine.connect(microphonePlayer, to: recordingMixer, format: Self.monoFormat)
+            audioEngine.connect(systemAudioPlayer, to: recordingMixer, format: Self.monoFormat)
+            audioEngine.connect(
+                recordingMixer,
+                to: audioEngine.mainMixerNode,
+                format: Self.monoFormat
+            )
+
+            configure(
+                feed: mixedFeed,
+                node: recordingMixer,
+                continuation: destination.continuation,
+                analyzerFormat: analyzerFormat
+            )
+            try configure(sink: mixedSink, node: recordingMixer, audioURL: destination.audioURL)
+
+            installTap(on: recordingMixer, feed: mixedFeed, sink: mixedSink)
+        }
+
+        // The taps are the only consumers. Muting the main mixer prevents captured
+        // meeting audio from being played back and causing feedback.
+        audioEngine.mainMixerNode.outputVolume = 0
+        audioEngine.prepare()
+        try audioEngine.start()
+        microphonePlayer.play()
+        systemAudioPlayer.play()
+    }
+
+    private func startCapture() async throws {
+        let content = try await SCShareableContent.current
+        let mainDisplayID = CGMainDisplayID()
+        guard let display = content.displays.first(where: { $0.displayID == mainDisplayID }) else {
+            throw MeetingAudioCaptureError.mainDisplayUnavailable
+        }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let configuration = SCStreamConfiguration()
+        configuration.width = 2
+        configuration.height = 2
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        configuration.queueDepth = 3
+        configuration.capturesAudio = true
+        configuration.sampleRate = Int(Self.monoFormat.sampleRate)
+        configuration.channelCount = 2
+        configuration.excludesCurrentProcessAudio = true
+        configuration.captureMicrophone = true
+        configuration.microphoneCaptureDeviceID = AVCaptureDevice.default(for: .audio)?.uniqueID
+
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: audioQueue)
+        self.stream = stream
+        try await stream.startCapture()
+    }
+
+    /// ストリームが落ちても、音声エンジンと認識器は動いたままになる。放っておくと
+    /// 無音を書き続け、録音が終わるまで気づけない。画面ロックのように一時的な理由なら
+    /// 元に戻るので、戻るまで張り直しを試みる。
+    private func beginRecovery() {
+        stateLock.withLock {
+            guard !isTearingDown, recoveryTask == nil else { return }
+            recoveryTask = Task { [weak self] in
+                await self?.recoverCapture()
+            }
+        }
+    }
+
+    /// 最初の数回は短い間隔で、その後は間隔を空けて粘る。画面が消えている間は
+    /// 対象のディスプレイ自体が見つからないので、何度でも失敗する前提で書く。
+    private func recoverCapture() async {
+        for attempt in 1...Self.recoveryAttemptLimit {
+            let interval = attempt <= Self.rapidRecoveryAttempts
+                ? Self.rapidRecoveryInterval
+                : Self.slowRecoveryInterval
+            await waitBeforeRetry(seconds: interval)
+            if Task.isCancelled { return }
+            if stateLock.withLock({ isTearingDown }) { return }
+
+            if let previous = stream {
+                try? await previous.stopCapture()
+                stream = nil
+            }
+            // 張り直したソースが実際に音を届け始めたことを、ログで追えるようにする。
+            reportedMicrophoneReady = false
+            reportedSystemAudioReady = false
+            stateLock.withLock { lastSampleAt = nil }
+
+            do {
+                try await startCapture()
+            } catch {
+                continue
+            }
+
+            // 画面がロックされたままだと、張り直し自体は成功しても音が流れてこない。
+            // API が例外を投げなかったことを復帰の証拠にすると、無音のまま
+            // 「復帰した」と記録してしまい、欠落に気づけなくなる。
+            guard await waitForSamples() else {
+                continue
+            }
+
+            if let recoveryHandler {
+                Task { @MainActor in
+                    recoveryHandler(attempt)
+                }
+            }
+            stateLock.withLock { recoveryTask = nil }
+            return
+        }
+
+        if let runtimeFailureHandler {
+            Task { @MainActor in
+                runtimeFailureHandler("画面が戻らないため、会議音声を再開できませんでした")
+            }
+        }
+        stateLock.withLock { recoveryTask = nil }
+    }
+
+    /// ストリームは `didStopWithError` を出さずに、静かにサンプルを止めることがある。
+    /// エラーを待っていると録音の最後まで無音に気づけないので、
+    /// 「届かなくなったこと」自体を定期的に確かめる。
+    private func startWatchdog() {
+        let task = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.watchdogInterval))
+                guard let self, !Task.isCancelled else { return }
+                if self.stateLock.withLock({ self.isTearingDown }) { return }
+
+                let gap = self.stateLock.withLock { () -> TimeInterval? in
+                    guard let last = self.lastSampleAt else { return nil }
+                    return Date().timeIntervalSince(last)
+                }
+                guard let gap, gap > Self.sampleGapTolerance else { continue }
+
+                // 復帰を待つ間に何度も通知しないよう、印を落としてから知らせる。
+                self.stateLock.withLock { self.lastSampleAt = nil }
+                self.report(failure: "音声が届かなくなりました")
+                self.beginRecovery()
+            }
+        }
+        stateLock.withLock { watchdogTask = task }
+    }
+
+    /// 張り直したストリームから実際に音が届くまで待つ。届かなければ復帰は失敗扱い。
+    private func waitForSamples() async -> Bool {
+        for _ in 0..<Self.sampleWaitPolls {
+            try? await Task.sleep(for: .milliseconds(Self.sampleWaitInterval))
+            if Task.isCancelled { return false }
+            if stateLock.withLock({ lastSampleAt != nil }) { return true }
+        }
+        return false
+    }
+
+    private func noteSampleArrived() {
+        stateLock.withLock { lastSampleAt = Date() }
+    }
+
+    private func report(failure message: String) {
+        guard let runtimeFailureHandler else { return }
+        Task { @MainActor in
+            runtimeFailureHandler(message)
+        }
+    }
+
+    private static let watchdogInterval = 5
+    /// 会議中の沈黙でもサンプル自体は届き続けるので、8秒途絶えたら異常とみなす。
+    private static let sampleGapTolerance: TimeInterval = 8
+    private static let sampleWaitPolls = 10
+    private static let sampleWaitInterval = 500
+    private static let rapidRecoveryAttempts = 5
+    private static let rapidRecoveryInterval = 3
+    private static let slowRecoveryInterval = 15
+    /// 約2時間ぶん。これを超えて画面が戻らないなら、録音を続ける意味がない。
+    private static let recoveryAttemptLimit = 480
+
+    private func attach(_ node: AVAudioNode) {
+        audioEngine.attach(node)
+        attachedNodes.append(node)
+    }
+
+    /// Formats are read back from the node after connecting, because a mixer settles its
+    /// output format when it is connected; assuming one here would desync the tap,
+    /// the converter and the recording file.
+    private func configure(
+        feed: AnalyzerFeed,
+        node: AVAudioNode,
+        continuation: AsyncStream<AnalyzerInput>.Continuation,
+        analyzerFormat: AVAudioFormat
+    ) {
+        feed.configure(
+            continuation: continuation,
+            sourceFormat: node.outputFormat(forBus: 0),
+            analyzerFormat: analyzerFormat
+        )
+    }
+
+    /// Recordings are stored as AAC. Uncompressed audio costs about 11MB per minute per
+    /// track, and Japanese mode writes two tracks, so an all-day recording would fill the
+    /// disk. AAC brings the same audio down to roughly 0.36MB per minute.
+    private func configure(sink: RecordingSink, node: AVAudioNode, audioURL: URL) throws {
+        let format = node.outputFormat(forBus: 0)
+        let file = try AVAudioFile(forWriting: audioURL, settings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: format.channelCount,
+            AVEncoderBitRateKey: 48_000 * Int(format.channelCount),
+        ])
+        // A compressed file rejects every buffer when its processing format differs from the
+        // tap, and RecordingSink discards those errors, which would leave an empty file
+        // behind. Settings copied from the tap keep the two in step, so verify it here.
+        guard file.processingFormat == format else {
+            throw MeetingAudioCaptureError.recordingFormatMismatch
+        }
+        sink.configure(audioFile: file)
+    }
+
+    /// A node carries at most one tap, so recording and recognition share one callback.
+    private func installTap(on node: AVAudioNode, feed: AnalyzerFeed?, sink: RecordingSink?) {
+        let format = node.outputFormat(forBus: 0)
+        node.installTap(onBus: 0, bufferSize: 2_048, format: format) { buffer, _ in
+            sink?.write(buffer)
+            feed?.send(buffer)
+        }
+        tappedNodes.append(node)
+    }
+
+    func stop() async {
+        let (pendingRecovery, pendingWatchdog) = stateLock.withLock {
+            () -> (Task<Void, Never>?, Task<Void, Never>?) in
+            isTearingDown = true
+            let recovery = recoveryTask
+            let watchdog = watchdogTask
+            recoveryTask = nil
+            watchdogTask = nil
+            lastSampleAt = nil
+            return (recovery, watchdog)
+        }
+        pendingRecovery?.cancel()
+        pendingWatchdog?.cancel()
+        removeWakeObservers()
+        displaySleepBlocker.end()
+
+        if let stream {
+            try? await stream.stopCapture()
+        }
+        stream = nil
+
+        audioQueue.sync {
+            microphonePlayer.stop()
+            systemAudioPlayer.stop()
+            if audioEngine.isRunning {
+                audioEngine.stop()
+            }
+            for node in tappedNodes {
+                node.removeTap(onBus: 0)
+            }
+            tappedNodes.removeAll()
+            for node in attachedNodes {
+                audioEngine.disconnectNodeOutput(node)
+            }
+            for node in attachedNodes {
+                audioEngine.detach(node)
+            }
+            attachedNodes.removeAll()
+            microphoneFeed.clear()
+            systemAudioFeed.clear()
+            mixedFeed.clear()
+            microphoneSink.clear()
+            systemAudioSink.clear()
+            mixedSink.clear()
+            stateLock.withLock {
+                microphoneConverter = nil
+                microphoneSourceFormat = nil
+                systemConverter = nil
+                systemSourceFormat = nil
+            }
+        }
+        runtimeFailureHandler = nil
+        sourceReadyHandler = nil
+        recoveryHandler = nil
+        reportedMicrophoneReady = false
+        reportedSystemAudioReady = false
+    }
+
+    private func consume(_ sampleBuffer: CMSampleBuffer, type: SCStreamOutputType) {
+        guard sampleBuffer.isValid,
+              CMSampleBufferDataIsReady(sampleBuffer),
+              let converted = pcmBuffer(from: sampleBuffer, type: type) else {
+            return
+        }
+
+        switch type {
+        case .microphone:
+            microphonePlayer.scheduleBuffer(converted)
+            noteSampleArrived()
+            reportSourceReadyIfNeeded(type: type)
+        case .audio:
+            systemAudioPlayer.scheduleBuffer(converted)
+            noteSampleArrived()
+            reportSourceReadyIfNeeded(type: type)
+        default:
+            break
+        }
+    }
+
+    private func reportSourceReadyIfNeeded(type: SCStreamOutputType) {
+        let source: String?
+        switch type {
+        case .microphone where !reportedMicrophoneReady:
+            reportedMicrophoneReady = true
+            source = "microphone"
+        case .audio where !reportedSystemAudioReady:
+            reportedSystemAudioReady = true
+            source = "system_audio"
+        default:
+            source = nil
+        }
+        guard let source, let sourceReadyHandler else { return }
+        Task { @MainActor in
+            sourceReadyHandler(source)
+        }
+    }
+
+    private func pcmBuffer(
+        from sampleBuffer: CMSampleBuffer,
+        type: SCStreamOutputType
+    ) -> AVAudioPCMBuffer? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(
+                formatDescription
+              ),
+              let format = AVAudioFormat(streamDescription: streamDescription) else {
+            return nil
+        }
+
+        var requiredSize = 0
+        var blockBuffer: CMBlockBuffer?
+        let sizeStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &requiredSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &blockBuffer
+        )
+        guard sizeStatus == noErr, requiredSize > 0 else { return nil }
+
+        let rawBuffer = UnsafeMutableRawPointer.allocate(
+            byteCount: requiredSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBuffer.deallocate() }
+
+        let audioBufferList = rawBuffer.assumingMemoryBound(to: AudioBufferList.self)
+        let listStatus = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: audioBufferList,
+            bufferListSize: requiredSize,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &blockBuffer
+        )
+        guard listStatus == noErr,
+              let borrowedBuffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                bufferListNoCopy: audioBufferList,
+                deallocator: nil
+              ) else {
+            return nil
+        }
+        borrowedBuffer.frameLength = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        return copyAndConvert(borrowedBuffer, type: type, to: Self.monoFormat)
+    }
+
+    private func copyAndConvert(
+        _ input: AVAudioPCMBuffer,
+        type: SCStreamOutputType,
+        to outputFormat: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let converter: AVAudioConverter? = stateLock.withLock {
+            if type == .microphone {
+                if input.format == microphoneSourceFormat, let microphoneConverter {
+                    return microphoneConverter
+                }
+                let converter = AVAudioConverter(from: input.format, to: outputFormat)
+                microphoneSourceFormat = input.format
+                microphoneConverter = converter
+                return converter
+            }
+
+            if input.format == systemSourceFormat, let systemConverter {
+                return systemConverter
+            }
+            let converter = AVAudioConverter(from: input.format, to: outputFormat)
+            if type == .audio {
+                systemSourceFormat = input.format
+                systemConverter = converter
+            }
+            return converter
+        }
+        guard let converter else { return nil }
+        return MeetingAudioConverterInputProvider.convert(
+            input,
+            using: converter,
+            to: outputFormat
+        )
+    }
+}
+
+extension MeetingAudioCaptureManager: SCStreamOutput {
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of type: SCStreamOutputType
+    ) {
+        guard type == .audio || type == .microphone else { return }
+        consume(sampleBuffer, type: type)
+    }
+}
+
+extension MeetingAudioCaptureManager: SCStreamDelegate {
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        report(failure: error.localizedDescription)
+        beginRecovery()
+    }
+}
+
+/// Feeds one captured signal into one recognizer.
+private final class AnalyzerFeed: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var converter: AVAudioConverter?
+    private var analyzerFormat: AVAudioFormat?
+
+    func configure(
+        continuation: AsyncStream<AnalyzerInput>.Continuation,
+        sourceFormat: AVAudioFormat,
+        analyzerFormat: AVAudioFormat
+    ) {
+        lock.withLock {
+            self.continuation = continuation
+            self.analyzerFormat = analyzerFormat
+            converter = AVAudioConverter(from: sourceFormat, to: analyzerFormat)
+        }
+    }
+
+    func send(_ buffer: AVAudioPCMBuffer) {
+        lock.withLock {
+            guard let continuation, let converter, let analyzerFormat else { return }
+            guard let converted = MeetingAudioConverterInputProvider.convert(
+                buffer,
+                using: converter,
+                to: analyzerFormat
+            ) else { return }
+            continuation.yield(AnalyzerInput(buffer: converted))
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            continuation = nil
+            converter = nil
+            analyzerFormat = nil
+        }
+    }
+}
+
+/// Writes one captured signal to disk.
+private final class RecordingSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var audioFile: AVAudioFile?
+
+    func configure(audioFile: AVAudioFile) {
+        lock.withLock { self.audioFile = audioFile }
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) {
+        lock.withLock {
+            try? audioFile?.write(from: buffer)
+        }
+    }
+
+    func clear() {
+        lock.withLock { audioFile = nil }
+    }
+}
+
+private final class MeetingAudioConverterInputProvider: @unchecked Sendable {
+    private let input: AVAudioPCMBuffer
+    private var supplied = false
+
+    init(_ input: AVAudioPCMBuffer) {
+        self.input = input
+    }
+
+    static func convert(
+        _ input: AVAudioPCMBuffer,
+        using converter: AVAudioConverter,
+        to outputFormat: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let ratio = outputFormat.sampleRate / input.format.sampleRate
+        let capacity = AVAudioFrameCount((Double(input.frameLength) * ratio).rounded(.up)) + 1
+        guard let output = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: capacity
+        ) else { return nil }
+
+        let inputProvider = MeetingAudioConverterInputProvider(input)
+        var conversionError: NSError?
+        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
+            inputProvider.next(status: inputStatus)
+        }
+        guard status != .error, conversionError == nil, output.frameLength > 0 else {
+            return nil
+        }
+        return output
+    }
+
+    func next(
+        status: UnsafeMutablePointer<AVAudioConverterInputStatus>
+    ) -> AVAudioBuffer? {
+        if supplied {
+            status.pointee = .noDataNow
+            return nil
+        }
+        supplied = true
+        status.pointee = .haveData
+        return input
+    }
+}
+
+private enum MeetingAudioCaptureError: LocalizedError {
+    case mainDisplayUnavailable
+    case recordingFormatMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .mainDisplayUnavailable:
+            "メイン画面に紐づくシステム音声を取得できません。"
+        case .recordingFormatMismatch:
+            "録音ファイルの形式が音声入力と一致しないため、録音を開始できません。"
+        }
+    }
+}

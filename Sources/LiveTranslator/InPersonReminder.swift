@@ -202,8 +202,12 @@ extension InPersonReminder: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let action = response.actionIdentifier
+        let category = response.notification.request.content.categoryIdentifier
         let end = response.notification.request.content.userInfo["end"] as? Double
         completionHandler()
+        // The same delegate receives the transcript-ready banner; clicking that one
+        // must not start a recording.
+        guard category == Self.categoryID else { return }
         guard action == Self.startActionID || action == UNNotificationDefaultActionIdentifier else { return }
         // A late click on a meeting that is already over must not start anything.
         if let end, Date().timeIntervalSince1970 >= end { return }

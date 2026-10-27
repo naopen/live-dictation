@@ -640,6 +640,16 @@ final class AppModel: NSObject, ObservableObject {
 
         reloadSessionHistory()
         scheduleTitleUpgrades()
+        // Skipped once the next meeting is already recording: a banner then would only
+        // appear on a shared screen.
+        if !isRecording,
+           !recordingSession.sessionFinalizedJapanese.isEmpty
+            || !recordingSession.sessionFinalizedEnglish.isEmpty {
+            TranscriptReadyNotice.post(
+                title: generatedTitle.title,
+                sessionDirectory: recordingSession.logger.directoryURL
+            )
+        }
         if activeSession == nil {
             englishText = recordingSession.finalizedEnglish
             japaneseText = sessionJapaneseText(for: recordingSession)
